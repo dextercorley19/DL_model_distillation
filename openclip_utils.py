@@ -24,7 +24,6 @@ import torch.nn.functional as F
 import torch.utils.data
 import PIL.Image
 from torch.utils.tensorboard import SummaryWriter
-import torch.nn as nn
 
 
 class EmptyEmbeddingDataset(object):
@@ -145,7 +144,6 @@ def precompute_clip_text_embeddings(output_path, labels):
 
 
 def eval_dataset_clip_embeddings(embeddings_dataset, text_embeddings, batch_size=64):
-
     # Determine the device
     if torch.backends.mps.is_available():
         device = torch.device("mps")
@@ -154,7 +152,6 @@ def eval_dataset_clip_embeddings(embeddings_dataset, text_embeddings, batch_size
     else:
         device = torch.device("cpu")
     print(f"Using device: {device} for eval_dataset_clip_embeddings")
-
     loader = torch.utils.data.DataLoader(
         dataset=embeddings_dataset,
         batch_size=batch_size
@@ -256,7 +253,7 @@ def eval_logits_model(
     else:
         device = torch.device("cpu")
     print(f"Using device: {device} for eval_logits_model")
-    
+        
     loader = torch.utils.data.DataLoader(
         dataset=dataset,
         batch_size=batch_size
@@ -354,6 +351,7 @@ def train_student_classification_model(
 
                 if text_embeddings is not None:
                     clip_image_embeddings = clip_image_embeddings / clip_image_embeddings.norm(dim=-1, keepdim=True)
+                    clip_image_embeddings = clip_image_embeddings
                     clip_logits = clip_image_embeddings @ text_embeddings.T
                 else:
                     clip_logits = probe_model(clip_image_embeddings)
@@ -437,7 +435,7 @@ def train_student_embedding_model(
     print(f"Using device: {device} for train_student_embedding_model")
 
     model = model.to(device)
-    
+        
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 
     train_loader = torch.utils.data.DataLoader(
@@ -598,15 +596,15 @@ def train_probe_model(
 
         probe_model.train()
         for _, label, clip_image_embeddings in tqdm.tqdm(iter(train_loader)):
-            # Ensure data is on the correct device
-            label = label.to(device)
-            clip_image_embeddings = clip_image_embeddings.to(device).detach() # Already detached in previous versions, good practice
-
+            with torch.no_grad():
+                label = label.to(device)
+                clip_image_embeddings = clip_image_embeddings.to(device).detach()
             optimizer.zero_grad()
             output_logits = probe_model(clip_image_embeddings)
 
-            # Using F.cross_entropy which combines log_softmax and nll_loss
-            loss = F.cross_entropy(temperature * output_logits, label)
+            output_logprob = F.log_softmax(temperature * output_logits, dim=-1)
+
+            loss = F.nll_loss(output_logprob, label)
 
             loss.backward()
             optimizer.step()
@@ -621,7 +619,7 @@ def train_probe_model(
         for _, label, clip_image_embeddings in tqdm.tqdm(iter(test_loader)):
             with torch.no_grad():
                 label = label.to(device)
-                clip_image_embeddings = clip_image_embeddings.to(device) # Ensure eval data is on device
+                clip_image_embeddings = clip_image_embeddings.to(device)                
                 output_logits = probe_model(clip_image_embeddings)
 
                 test_acc += int(torch.count_nonzero(output_logits.argmax(dim=-1) == label))
@@ -634,13 +632,11 @@ def train_probe_model(
         writer.add_scalar("train_loss", train_loss, global_step=epoch)
         writer.add_scalar("test_acc", test_acc, global_step=epoch)
 
-        # Always save the checkpoint for the current epoch
-        checkpoint_path = os.path.join(output_dir, f"checkpoint_{epoch}.pth")
-        print(f"Saving checkpoint for epoch {epoch} to {checkpoint_path}")
-        torch.save(probe_model.state_dict(), checkpoint_path)
-
-        # Update best_train_loss (this can be used for other purposes, like saving a separate 'best_model.pth')
         if train_loss < best_train_loss:
+
+            checkpoint_path = os.path.join(output_dir, f"checkpoint_{epoch}.pth")
+            print(f"Saving checkpoint to {checkpoint_path}")
+            torch.save(probe_model.state_dict(), checkpoint_path)
             best_train_loss = train_loss
 
 def train_model_from_scratch(
@@ -670,95 +666,75 @@ def train_model_from_scratch(
     else:
         device = torch.device("cpu")
 
-    print(f"Using device: {device} for train_model_from_scratch")
-
-    model = model.to(device)  # Move model to the selected device
-
+    print(f"Using device: {device} for train_model_from_scratch")    
+    model = model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 
     train_loader = torch.utils.data.DataLoader(
         dataset=train_dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=num_workers,
-        pin_memory=True if device.type != 'cpu' else False
+        num_workers=num_workers
     )
 
-    if test_dataset:
-        test_loader = torch.utils.data.DataLoader(
-            dataset=test_dataset,
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=num_workers,
-            pin_memory=True if device.type != 'cpu' else False
-        )
-    else:
-        test_loader = None
-        
-    criterion = nn.CrossEntropyLoss()
+    test_loader = torch.utils.data.DataLoader(
+        dataset=test_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers
+    )
 
+    best_train_loss = 1e9
     for epoch in range(num_epochs):
-        model.train()
-        running_loss = 0.0
-        for i, data in enumerate(train_loader):
-            if len(data) == 3:
-                inputs, labels, _ = data 
-            elif len(data) == 2:
-                inputs, labels = data
-            else:
-                raise ValueError("Train loader is returning an unexpected number of items per batch.")
 
-            inputs, labels = inputs.to(device), labels.to(device)
+        # Train
+        train_loss = 0.
+
+        model.train()
+        for image, label, _ in tqdm.tqdm(iter(train_loader)):
+            with torch.no_grad():
+                image = image.to(device)
+                label = label.to(device)
 
             optimizer.zero_grad()
-            outputs = model(inputs)
-            loss = criterion(outputs, labels)
+            output_logits = model(image)
+
+            output_logprob = F.log_softmax(output_logits, dim=-1)
+
+            loss = F.nll_loss(output_logprob, label)
+
             loss.backward()
             optimizer.step()
 
-            running_loss += loss.item()
-            if (i + 1) % 100 == 0:
-                avg_batch_loss = running_loss / 100
-                print(f'[Epoch {epoch + 1}, Batch {i + 1}] loss: {avg_batch_loss:.3f}')
-                writer.add_scalar('training_loss_batch',
-                                avg_batch_loss,
-                                epoch * len(train_loader) + i + 1)
-                running_loss = 0.0
-        
-        epoch_loss = running_loss / (len(train_loader) % 100) if (len(train_loader) % 100 != 0 and running_loss > 0) else (running_loss / 100 if running_loss > 0 else 0)
-        if epoch_loss > 0 and (len(train_loader) % 100 != 0):
-             writer.add_scalar('training_loss_epoch_avg', epoch_loss, epoch + 1)
+            train_loss += float(loss)
 
-        if test_loader:
-            model.eval()
-            correct = 0
-            total = 0
-            test_loss_val = 0
+        train_loss /= len(train_loader)
+
+        # Eval
+        model.eval()
+        test_acc = 0.
+        for image, label, _ in tqdm.tqdm(iter(test_loader)):
             with torch.no_grad():
-                for data in test_loader:
-                    if len(data) == 3:
-                        images, labels, _ = data
-                    elif len(data) == 2:
-                        images, labels = data
-                    else:
-                        raise ValueError("Test loader is returning an unexpected number of items per batch.")
-                    
-                    images, labels = images.to(device), labels.to(device)
-                    outputs = model(images)
-                    loss = criterion(outputs, labels)
-                    test_loss_val += loss.item()
-                    _, predicted = torch.max(outputs.data, 1)
-                    total += labels.size(0)
-                    correct += (predicted == labels).sum().item()
-            
-            avg_test_loss = test_loss_val / len(test_loader)
-            accuracy = 100 * correct / total
-            writer.add_scalar('test_loss_epoch', avg_test_loss, epoch + 1)
-            writer.add_scalar('test_accuracy_epoch', accuracy, epoch + 1)
-            print(f'Epoch {epoch + 1} - Test Loss: {avg_test_loss:.4f}, Test Accuracy: {accuracy:.2f}%')
+                image = image.to(device)
+                label = label.to(device)
+                output_logits = model(image)
 
-    print('Finished Training')
-    writer.close()
+                test_acc += int(torch.count_nonzero(output_logits.argmax(dim=-1) == label))
+        test_acc = round(100 * test_acc / len(test_dataset), 3)
+
+        logstr = f"| EPOCH {epoch} | TRAIN LOSS {train_loss} | TEST ACC {test_acc} |"
+        print(logstr)
+        with open(os.path.join(output_dir, 'log.txt'), 'a') as f:
+            f.write(logstr + "\n")
+        writer.add_scalar("train_loss", train_loss, global_step=epoch)
+        writer.add_scalar("test_acc", test_acc, global_step=epoch)
+
+        if train_loss < best_train_loss:
+
+            checkpoint_path = os.path.join(output_dir, f"checkpoint_{epoch}.pth")
+            print(f"Saving checkpoint to {checkpoint_path}")
+            torch.save(model.state_dict(), checkpoint_path)
+            best_train_loss = train_loss
 
 if __name__ == "__main__":
 

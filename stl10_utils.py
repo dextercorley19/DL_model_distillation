@@ -105,7 +105,8 @@ def precompute_clip_stl10_test_image_embeddings():
 def precompute_clip_stl10_text_embeddings():
     precompute_clip_text_embeddings(
         output_path="data/clip/stl10_text_embeddings.pt",
-        labels=STL10_LABELS
+        labels=STL10_LABELS,
+
     )
 
 
@@ -181,55 +182,20 @@ def eval_stl10_test_clip_embeddings():
 
 # Probe ablation
 
-# Define a simple Linear Probe model
-class LinearProbe(nn.Module):
-    def __init__(self, input_dim, num_classes):
-        super().__init__()
-        self.fc = nn.Linear(input_dim, num_classes)
-
-    def forward(self, x):
-        return self.fc(x)
 
 def train_probe_model_linear():
-    output_dir = "data/experiments/train_probe_model_linear"
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-
-    # Assuming ViT-B-32 CLIP model which has 512-dim embeddings
-    probe_model_instance = LinearProbe(input_dim=512, num_classes=len(STL10_LABELS))
-    
-    # Determine device
-    if torch.backends.mps.is_available():
-        device = torch.device("mps")
-    elif torch.cuda.is_available():
-        device = torch.device("cuda")
-    else:
-        device = torch.device("cpu")
-    print(f"Using device: {device} for train_probe_model_linear")
-    probe_model_instance.to(device)
-
-    train_dataset = get_stl10_train_embedding_dataset()
-    test_dataset = get_stl10_test_embedding_dataset()
-
-    if len(train_dataset) == 0:
-        print("Error: STL10 train embedding dataset is empty. Cannot train probe model.")
-        return
-    
-    print(f"Starting training for linear probe model. Output will be in {output_dir}")
-    # train_probe_model is from openclip_utils
     train_probe_model(
-        output_dir=output_dir,
-        probe_model=probe_model_instance,
-        train_dataset=train_dataset,
-        test_dataset=test_dataset, 
-        learning_rate=1e-3,
+        output_dir="data/experiments/train_probe_model_linear",
+        probe_model=nn.Linear(512, len(STL10_LABELS)),
+        train_dataset=get_stl10_train_embedding_dataset(),
+        test_dataset=get_stl10_test_embedding_dataset(),
+        learning_rate=3e-4,
         batch_size=64,
-        num_workers=2, # Adjusted for broader compatibility
-        num_epochs=10, # Changed from 15 to 10
-        temperature=100., 
+        num_workers=8,
+        num_epochs=15,
+        temperature=1.,
         seed=0
     )
-    print("Finished training for linear probe model.")
 
 
 def train_probe_model_mlp():
@@ -247,7 +213,7 @@ def train_probe_model_mlp():
         learning_rate=3e-4,
         batch_size=64,
         num_workers=8,
-        num_epochs=10,
+        num_epochs=15,
         temperature=1.,
         seed=0
     )
@@ -257,67 +223,32 @@ def train_student_linear_probe(
         output_dir: str,
         arch: str,
         temperature: float=1.,
-        train_dataset = None, # For student model
-        test_dataset=None     # For student model
+        train_dataset = None,
+        test_dataset=None
     ):
-    # Define the probe model architecture (must match what train_probe_model_linear trains)
-    # ViT-B-32 CLIP embeddings are 512-dimensional.
-    probe_model_instance = LinearProbe(input_dim=512, num_classes=len(STL10_LABELS))
-
-    # Determine device for the probe model
-    if torch.backends.mps.is_available():
-        device = torch.device("mps")
-    elif torch.cuda.is_available():
-        device = torch.device("cuda")
-    else:
-        device = torch.device("cpu")
-    print(f"Using device: {device} for probe model in train_student_linear_probe")
-    probe_model_instance.to(device)
-
-    probe_checkpoint_dir = "data/experiments/train_probe_model_linear"
-    probe_checkpoint_filename = "checkpoint_9.pth" # Changed from checkpoint_14.pth
-    probe_checkpoint_path = os.path.join(probe_checkpoint_dir, probe_checkpoint_filename)
-
-    if not os.path.exists(probe_checkpoint_path):
-        print(f"Probe checkpoint {probe_checkpoint_path} not found. Attempting to train probe model...")
-        if not os.path.exists(probe_checkpoint_dir):
-            os.makedirs(probe_checkpoint_dir)
-        train_probe_model_linear() # Train the probe
-
-    # Check again after attempting to train
-    if os.path.exists(probe_checkpoint_path):
-        print(f"Loading probe model weights from {probe_checkpoint_path}")
-        try:
-            probe_model_instance.load_state_dict(torch.load(probe_checkpoint_path, map_location=device))
-            probe_model_instance.eval() # Set to eval mode after loading
-        except Exception as e:
-            print(f"Error loading probe model state_dict: {e}")
-            raise FileNotFoundError(f"Failed to load probe checkpoint {probe_checkpoint_path} even after attempting to train.")
-    else:
-        raise FileNotFoundError(f"Probe checkpoint {probe_checkpoint_path} still not found after attempting to train.")
-
-    # Student model training
     if train_dataset is None:
-        print("Error: train_dataset for student model is not provided to train_student_linear_probe.")
-        return
-
-    print(f"Starting student model training (arch: {arch}) using linear probe.")
-    # train_student_classification_model is from openclip_utils
+        train_dataset = get_stl10_train_unlabeled_embedding_dataset()
+    if test_dataset is None:
+        test_dataset = get_stl10_test_embedding_dataset()
+    # call train_probe_model_linear first
+    probe_model = nn.Linear(512, len(STL10_LABELS))
+    probe_weights = "data/experiments/train_probe_model_linear/checkpoint_14.pth"
+    if not os.path.exists(probe_weights):
+        train_probe_model_linear()
+    probe_model.load_state_dict(torch.load("data/experiments/train_probe_model_linear/checkpoint_14.pth"))
     train_student_classification_model(
         output_dir=output_dir,
-        model=timm.create_model(arch, num_classes=len(STL10_LABELS), pretrained=False),
-        train_dataset=train_dataset, 
-        test_dataset=test_dataset,   
-        learning_rate=1e-3, 
-        batch_size=64,    
-        num_workers=2, # Adjusted for broader compatibility
-        num_epochs=10,    
-        probe_model=probe_model_instance, 
-        temperature=temperature, 
+        model=timm.create_model(arch, num_classes=len(STL10_LABELS)),
+        train_dataset=train_dataset,
+        test_dataset=test_dataset,
+        learning_rate=3e-4,
+        batch_size=64,
+        num_workers=8,
+        num_epochs=50,
+        temperature=temperature,
+        probe_model=probe_model,
         seed=0
     )
-    print("Finished student model training using linear probe.")
-    
 
 def train_student_zero_shot(
         output_dir: str,
@@ -338,7 +269,7 @@ def train_student_zero_shot(
         learning_rate=3e-4,
         batch_size=64,
         num_workers=8,
-        num_epochs=10,
+        num_epochs=50,
         temperature=temperature,
         text_embeddings=get_clip_stl10_text_embeddings(),
         seed=0
@@ -355,7 +286,7 @@ def train_resnet18_from_scratch():
         learning_rate=3e-4,
         batch_size=64,
         num_workers=8,
-        num_epochs=10,
+        num_epochs=50,
         seed=0
     )
 
@@ -451,7 +382,7 @@ def train_embedding_text(output_dir: str, arch: str, train_dataset=None,
         learning_rate=3e-4,
         batch_size=64,
         num_workers=8,
-        num_epochs=10,
+        num_epochs=50,
         text_embeddings=get_clip_stl10_text_embeddings(),
         seed=0,
         include_test_accuracy=True,
